@@ -19829,6 +19829,18 @@ fn const_eval_user_call(
     if let Some(p) = params {
         shell.parameters = p.clone();
     }
+    // The typedefs in scope, so a typedef-typed local or return value
+    // (`byte_t [3:0] r;`) gets its width: the empty shell sized every
+    // typedef as 32 bits.
+    if fn_uses_type_reference(&fd) {
+        TYPEDEFS_TLS.with(|td| {
+            if let Some(m) = td.borrow().as_ref() {
+                for (k, w) in m.iter() {
+                    shell.typedefs.insert_if_absent(k.clone(), *w);
+                }
+            }
+        });
+    }
     shell.functions = FuncTable::from_map((*funcs).clone());
     let mut argv = Vec::with_capacity(args.len());
     for a in args {
@@ -38029,7 +38041,13 @@ fn eval_const_user_function(
     }
     // The implicit return variable (typed per the declared return type).
     let return_type = resolve_typedef_chain(&fd.return_type, &elab.typedef_types);
-    let return_width = resolve_type_width(return_type, Some(&locals), Some(&elab.typedefs));
+    // Sized from the DECLARED type: following the typedef chain drops the
+    // reference's own packed dimensions (`byte_t [3:0]` became `logic [7:0]`).
+    let return_width = if packed_elems(&fd.return_type, &locals, elab).is_some() {
+        resolve_type_width(&fd.return_type, Some(&locals), Some(&elab.typedefs))
+    } else {
+        resolve_type_width(return_type, Some(&locals), Some(&elab.typedefs))
+    };
     let ret_init = if is_type_real(return_type) {
         Value::from_f64(0.0)
     } else {
@@ -38043,6 +38061,20 @@ fn eval_const_user_function(
         value
     };
     locals.insert(fname.clone(), ret_init);
+    let mut frame: HashMap<String, PackedElems> = HashMap::default();
+    if let Some(pe) = packed_elems(&fd.return_type, &locals, elab) {
+        frame.insert(fname.clone(), pe);
+    }
+    CONST_FN_PACKED_ELEMS.with(|f| f.borrow_mut().push(frame));
+    struct PopFrame;
+    impl Drop for PopFrame {
+        fn drop(&mut self) {
+            CONST_FN_PACKED_ELEMS.with(|f| {
+                f.borrow_mut().pop();
+            });
+        }
+    }
+    let _pop = PopFrame;
 
     enum Flow {
         Normal,
@@ -38077,6 +38109,18 @@ fn eval_const_user_function(
                 };
                 let idx = eval_fn_expr(index, locals, elab, depth)?.to_i64()?;
                 let value = locals.get_mut(&name)?;
+                // §7.4.5: an index into a packed array selects one ELEMENT.
+                if let Some(pe) = frame_packed_elems(&name) {
+                    let lsb = pe.element_lsb(idx)?;
+                    if lsb + pe.width > value.width {
+                        return None;
+                    }
+                    let rhs = rhs.resize(pe.width);
+                    for b in 0..pe.width {
+                        value.set_bit((lsb + b) as usize, rhs.get_bit(b as usize));
+                    }
+                    return Some(());
+                }
                 if idx < 0 || idx as u32 >= value.width {
                     return None;
                 }
@@ -38147,7 +38191,15 @@ fn eval_const_user_function(
                 let width =
                     resolve_type_width(data_type, Some(locals), Some(&elab.typedefs)).max(1);
                 let signed = is_type_signed(data_type);
+                let shape = packed_elems(data_type, locals, elab);
                 for d in declarators {
+                    if let Some(pe) = shape {
+                        CONST_FN_PACKED_ELEMS.with(|f| {
+                            if let Some(top) = f.borrow_mut().last_mut() {
+                                top.insert(d.name.name.clone(), pe);
+                            }
+                        });
+                    }
                     let mut v = match &d.init {
                         Some(e) => eval_fn_expr(e, locals, elab, depth)?,
                         None => Value::zero(width),
@@ -38159,6 +38211,41 @@ fn eval_const_user_function(
                 Some(Flow::Normal)
             }
             SK::BlockingAssign { lvalue, rvalue } => {
+                // §10.9.2: an assignment pattern to a packed array of
+                // multi-bit elements fills it element by element.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind
+                    && let Some(name) = local_ident_name(lvalue)
+                    && let Some(pe) = frame_packed_elems(name)
+                {
+                    let n = ((pe.left - pe.right).unsigned_abs() + 1) as usize;
+                    let mut elems: Vec<Value> = Vec::with_capacity(n);
+                    use crate::ast::expr::AssignmentPatternItem as Item;
+                    match items.as_slice() {
+                        [Item::Default(d)] => {
+                            let v = eval_fn_expr(d, locals, elab, depth)?.resize(pe.width);
+                            elems.resize(n, v);
+                        }
+                        _ if items.len() == n
+                            && items.iter().all(|i| matches!(i, Item::Ordered(_))) =>
+                        {
+                            for it in items {
+                                let Item::Ordered(e) = it else { return None };
+                                elems.push(eval_fn_expr(e, locals, elab, depth)?.resize(pe.width));
+                            }
+                        }
+                        _ => return None,
+                    }
+                    let mut v = Value::zero(pe.width * n as u32);
+                    // The first item is the LEFT (most significant) element.
+                    for (k, e) in elems.iter().enumerate() {
+                        let lsb = (n - 1 - k) as u32 * pe.width;
+                        for b in 0..pe.width {
+                            v.set_bit((lsb + b) as usize, e.get_bit(b as usize));
+                        }
+                    }
+                    assign_local(lvalue, v, locals, elab, depth)?;
+                    return Some(Flow::Normal);
+                }
                 let v = eval_fn_expr(rvalue, locals, elab, depth)?;
                 assign_local(lvalue, v, locals, elab, depth)?;
                 Some(Flow::Normal)
@@ -38398,6 +38485,28 @@ fn eval_const_user_function(
             let taken = if c.is_true() { then_expr } else { else_expr };
             return eval_fn_expr(taken, locals, elab, depth);
         }
+        // §7.4.5: an element of a packed array of multi-bit elements. Read
+        // directly; nested in a larger expression the generic evaluator
+        // would bit-select it, so defer the call instead.
+        if let ExprKind::Index { expr: base, index } = &e.kind
+            && let Some(name) = local_ident_name(base)
+            && let Some(pe) = frame_packed_elems(name)
+        {
+            let idx = eval_fn_expr(index, locals, elab, depth)?.to_i64()?;
+            let lsb = pe.element_lsb(idx)?;
+            let v = locals.get(name)?;
+            if lsb + pe.width > v.width {
+                return None;
+            }
+            let mut out = Value::zero(pe.width);
+            for b in 0..pe.width {
+                out.set_bit(b as usize, v.get_bit((lsb + b) as usize));
+            }
+            return Some(out);
+        }
+        if selects_packed_elem_local(e) {
+            return None;
+        }
         // Nested calls: substitute first, then const-eval.
         let subbed = substitute_const_fn_calls(e, locals, elab, depth + 1)?;
         if expr_has_call(&subbed) {
@@ -38433,6 +38542,149 @@ fn eval_const_user_function(
     let mut v = v.resize(rw);
     v.is_signed = is_type_signed(return_type);
     Some(v)
+}
+
+/// The outer packed dimension of a constant-function local that is a
+/// packed array of multi-bit elements (`byte_t [3:0] r`, `logic [3:0][7:0]
+/// r`): its declared bounds and the width of one element.
+#[derive(Clone, Copy)]
+struct PackedElems {
+    left: i64,
+    right: i64,
+    width: u32,
+}
+
+impl PackedElems {
+    /// The LSB of element `idx` (§7.4.5: the left bound is the most
+    /// significant element), or None when out of range.
+    fn element_lsb(&self, idx: i64) -> Option<u32> {
+        let (lo, hi) = (self.left.min(self.right), self.left.max(self.right));
+        if idx < lo || idx > hi {
+            return None;
+        }
+        let pos = if self.left >= self.right {
+            idx - self.right
+        } else {
+            self.right - idx
+        };
+        Some(pos as u32 * self.width)
+    }
+}
+
+thread_local! {
+    /// Per constant-function call frame: the locals that are packed arrays
+    /// of multi-bit elements (see `PackedElems`), innermost frame last.
+    static CONST_FN_PACKED_ELEMS: std::cell::RefCell<Vec<HashMap<String, PackedElems>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn frame_packed_elems(name: &str) -> Option<PackedElems> {
+    CONST_FN_PACKED_ELEMS.with(|f| f.borrow().last().and_then(|m| m.get(name).copied()))
+}
+
+/// `PackedElems` of `dt` when it is a packed array whose elements are wider
+/// than one bit: a typedef with packed dimensions of its own, or a vector
+/// with more than one packed dimension.
+fn packed_elems(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+) -> Option<PackedElems> {
+    let first = match dt {
+        DataType::TypeReference { dimensions, .. } => dimensions.first()?,
+        DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
+            if dimensions.len() > 1 =>
+        {
+            &dimensions[0]
+        }
+        _ => return None,
+    };
+    let PackedDimension::Range { left, right, .. } = first else {
+        return None;
+    };
+    let l = const_eval_i64_with_params(left, Some(params))?;
+    let r = const_eval_i64_with_params(right, Some(params))?;
+    let n = (l - r).unsigned_abs() + 1;
+    let total = u64::from(resolve_type_width(dt, Some(params), Some(&elab.typedefs)));
+    if n == 0 || total % n != 0 || total / n < 2 {
+        return None;
+    }
+    Some(PackedElems {
+        left: l,
+        right: r,
+        width: (total / n) as u32,
+    })
+}
+
+fn local_ident_name(e: &Expression) -> Option<&str> {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+            Some(h.path[0].name.name.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Whether `e` selects into a local that is a packed array of multi-bit
+/// elements anywhere below its root.
+fn selects_packed_elem_local(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Index { expr, index } => {
+            local_ident_name(expr).is_some_and(|n| frame_packed_elems(n).is_some())
+                || selects_packed_elem_local(expr)
+                || selects_packed_elem_local(index)
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => {
+            local_ident_name(expr).is_some_and(|n| frame_packed_elems(n).is_some())
+                || selects_packed_elem_local(expr)
+                || selects_packed_elem_local(left)
+                || selects_packed_elem_local(right)
+        }
+        ExprKind::Ident(h) => h
+            .path
+            .iter()
+            .any(|seg| !seg.selects.is_empty() && frame_packed_elems(&seg.name.name).is_some()),
+        ExprKind::Paren(i) => selects_packed_elem_local(i),
+        ExprKind::Unary { operand, .. } => selects_packed_elem_local(operand),
+        ExprKind::Binary { left, right, .. } => {
+            selects_packed_elem_local(left) || selects_packed_elem_local(right)
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            selects_packed_elem_local(condition)
+                || selects_packed_elem_local(then_expr)
+                || selects_packed_elem_local(else_expr)
+        }
+        ExprKind::Concatenation(items) => items.iter().any(selects_packed_elem_local),
+        ExprKind::Replication { count, exprs } => {
+            selects_packed_elem_local(count) || exprs.iter().any(selects_packed_elem_local)
+        }
+        ExprKind::Call { args, .. } => args.iter().any(selects_packed_elem_local),
+        _ => false,
+    }
+}
+
+/// Whether `fd` names a typedef in its return type, a port or a local.
+fn fn_uses_type_reference(fd: &FunctionDeclaration) -> bool {
+    fn stmt_has(st: &Statement) -> bool {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::VarDecl { data_type, .. } => matches!(data_type, DataType::TypeReference { .. }),
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => stmts.iter().any(stmt_has),
+            _ => false,
+        }
+    }
+    matches!(fd.return_type, DataType::TypeReference { .. })
+        || fd
+            .ports
+            .iter()
+            .any(|p| matches!(p.data_type, DataType::TypeReference { .. }))
+        || fd.items.iter().any(stmt_has)
 }
 
 /// STRICT support check: only expression shapes we KNOW
