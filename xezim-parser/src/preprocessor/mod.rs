@@ -512,6 +512,43 @@ impl Preprocessor {
         matches!(it.next(), Some("end_protected") | Some("end"))
     }
 
+    /// `` ` <directive>``: a grave accent, whitespace, then a compiler
+    /// directive name. Returns the directive name.
+    fn spaced_directive(trimmed: &str) -> Option<&str> {
+        const NAMES: &[&str] = &[
+            "define",
+            "undef",
+            "undefineall",
+            "ifdef",
+            "ifndef",
+            "elsif",
+            "else",
+            "endif",
+            "include",
+            "line",
+            "pragma",
+            "resetall",
+            "timescale",
+            "begin_keywords",
+            "end_keywords",
+            "celldefine",
+            "endcelldefine",
+            "default_nettype",
+            "unconnected_drive",
+            "nounconnected_drive",
+        ];
+        let rest = trimmed.strip_prefix('`')?;
+        if !rest.starts_with([' ', '\t']) {
+            return None;
+        }
+        let rest = rest.trim_start();
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let word = &rest[..end];
+        NAMES.contains(&word).then_some(word)
+    }
+
     fn is_directive(trimmed: &str, name: &str) -> bool {
         if let Some(rest) = trimmed
             .strip_prefix('`')
@@ -1080,6 +1117,25 @@ impl Preprocessor {
             self.cur_line_text.push_str(line);
             here = fixed.unwrap_or(LineOrigin::plain(self.cur_file_idx, self.current_line, col));
             let trimmed = fast_trim(line);
+
+            // Whitespace between the grave accent and a directive name
+            // (`` ` ifdef X``) is not legal (§22.1), but other simulators take
+            // it as the directive. Do the same, with a warning, rather than
+            // pass the text through to the parser.
+            let respaced: String;
+            let (line, trimmed) = match Self::spaced_directive(trimmed) {
+                Some(word) => {
+                    eprintln!(
+                        "warning: {}:{}: whitespace after '`' in directive '`{word}' \
+                         (IEEE 1800-2017 §22.1); accepted as the directive",
+                        self.current_file, self.current_line
+                    );
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    respaced = format!("{indent}`{}", trimmed[1..].trim_start());
+                    (respaced.as_str(), fast_trim(respaced.as_str()))
+                }
+                None => (line, trimmed),
+            };
 
             // Strip (* ... *) attributes (IEEE 1800-2017 §5.12)
             if trimmed.starts_with("(*") && trimmed.ends_with("*)") {
