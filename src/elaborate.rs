@@ -9781,7 +9781,12 @@ pub fn elaborate_module_with_defs(
                             } else if !init_items.is_empty() {
                                 let mut stmts: Vec<Statement> = Vec::new();
                                 for (i, item_expr) in init_items.iter().enumerate() {
-                                    let idx_i = lo + i as i64;
+                                    let idx_i = unpacked_init_index(
+                                        &elab,
+                                        &decl.name.name,
+                                        i,
+                                        lo + i as i64,
+                                    );
                                     let lval = Expression::new(
                                         ExprKind::Index {
                                             expr: Box::new(make_ident_expr(&decl.name.name)),
@@ -16342,7 +16347,12 @@ fn elaborate_items_numbered(
                             } else if !init_items.is_empty() {
                                 let mut stmts: Vec<Statement> = Vec::new();
                                 for (i, item_expr) in init_items.iter().enumerate() {
-                                    let idx_i = lo + i as i64;
+                                    let idx_i = unpacked_init_index(
+                                        &elab,
+                                        &decl.name.name,
+                                        i,
+                                        lo + i as i64,
+                                    );
                                     let lval = Expression::new(
                                         ExprKind::Index {
                                             expr: Box::new(make_ident_expr(&decl.name.name)),
@@ -28401,9 +28411,11 @@ fn inline_instantiations_inner(
                                     // `name[i] = item` lands where reads look.
                                     let mut stmts: Vec<Statement> = Vec::new();
                                     for (i, item_expr) in init_items.iter().enumerate() {
+                                        let idx_i =
+                                            unpacked_init_index(elab, &decl.name.name, i, i as i64);
                                         let lval = Expression::new(ExprKind::Index {
                                             expr: Box::new(make_ident_expr(&decl.name.name)),
-                                            index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: i.to_string(), cached_val: std::cell::Cell::new(None) }), Span::dummy())),
+                                            index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: idx_i.to_string(), cached_val: std::cell::Cell::new(None) }), Span::dummy())),
                                         }, Span::dummy());
                                         stmts.push(Statement::new(
                                             StatementKind::BlockingAssign {
@@ -41055,6 +41067,19 @@ pub fn whole_array_assign_parts_dir(
     if let ExprKind::AssignmentPattern(_) = &rhs.kind {
         return pattern_array_assign_parts(lhs, rhs, delay, arrays, descending, decl_dims);
     }
+    // §10.10: braces assigned to an unpacked array are an unpacked array
+    // concatenation. When no item is itself an array (which would splice
+    // its elements in), each item is one element, filled from the left
+    // bound like the positional pattern it equals.
+    let is_array = |n: String| {
+        arrays.contains_key(&n)
+            || decl_dims.is_some_and(|d| d.get(&n).is_some_and(|v| !v.is_empty()))
+    };
+    if ident_flat_name(lhs).is_some_and(is_array)
+        && let Some(pat) = unpacked_concat_as_pattern(rhs, arrays)
+    {
+        return pattern_array_assign_parts(lhs, &pat, delay, arrays, descending, decl_dims);
+    }
     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
         return None;
     };
@@ -41092,6 +41117,42 @@ pub fn whole_array_assign_parts_dir(
             })
             .collect(),
     )
+}
+
+/// The positional assignment pattern equal to the unpacked array
+/// concatenation `e` (§10.10), nested braces becoming nested patterns. None
+/// when `e` is not braces, or an item names an array: its elements would
+/// splice in rather than fill one element.
+fn unpacked_concat_as_pattern(
+    e: &Expression,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+) -> Option<Expression> {
+    let ExprKind::Concatenation(items) = &e.kind else {
+        return None;
+    };
+    let names_array = |x: &Expression| ident_flat_name(x).is_some_and(|n| arrays.contains_key(&n));
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        let item = match &it.kind {
+            ExprKind::Concatenation(_) => unpacked_concat_as_pattern(it, arrays)?,
+            ExprKind::Ident(_) if names_array(it) => return None,
+            ExprKind::RangeSelect { expr, .. } if names_array(expr) => return None,
+            _ => it.clone(),
+        };
+        out.push(crate::ast::expr::AssignmentPatternItem::Ordered(item));
+    }
+    Some(Expression::new(ExprKind::AssignmentPattern(out), e.span))
+}
+
+/// §10.10: the index the `i`-th item of an unpacked array initializer fills,
+/// counted from the LEFT bound, so a descending `[2:0]` takes its first item
+/// at 2. `fallback` when `name` is not a registered fixed array.
+fn unpacked_init_index(elab: &ElaboratedModule, name: &str, i: usize, fallback: i64) -> i64 {
+    match elab.arrays.get(name) {
+        Some(&(_, hi, _)) if elab.descending_arrays.contains(name) => hi - i as i64,
+        Some(&(lo, _, _)) => lo + i as i64,
+        None => fallback,
+    }
 }
 
 /// §10.3 / §10.9: `assign arr = '{...};` — a continuous assignment of an
