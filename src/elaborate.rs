@@ -3596,13 +3596,16 @@ pub struct ElaboratedModule {
 }
 
 /// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
-/// control. `active_high` distinguishes `tranif1` from `tranif0`.
+/// control. `active_high` distinguishes `tranif1` from `tranif0`; `resistive`
+/// marks the `rtran*` forms, which reduce the strength they pass (§28.13).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TranSwitch {
     pub a: Expression,
     pub b: Expression,
     pub ctl: Option<Expression>,
     pub active_high: bool,
+    #[serde(default)]
+    pub resistive: bool,
 }
 
 impl ElaboratedModule {
@@ -40647,63 +40650,152 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
         let (term_a, term_b) = (make_ident_expr(&na), make_ident_expr(&nb));
         let span = sw.a.span;
 
-        // Each terminal's OWN drivers, folded with the wired-net resolution.
-        let mut take_drivers = |name: &str| -> Option<Expression> {
-            let mut rhs: Vec<Expression> = Vec::new();
+        // Each terminal's OWN drivers, each with its §28.12 strength: a
+        // strength marker (`$__drive`/`$__pull`/...) gives its pair, a
+        // tristate primitive keeps its control, anything else is strong.
+        let mut take_drivers = |name: &str| -> Vec<StrengthDriver> {
+            let mut out: Vec<StrengthDriver> = Vec::new();
             elab.continuous_assigns.retain(|ca| {
-                if ident_flat_name(&ca.lhs).map(&norm).as_deref() == Some(name) {
-                    rhs.push(ca.rhs.clone());
-                    false
-                } else {
-                    true
+                if ident_flat_name(&ca.lhs).map(&norm).as_deref() != Some(name) {
+                    return true;
                 }
+                out.push(switch_terminal_driver(ca));
+                false
             });
-            let mut it = rhs.into_iter();
-            let first = it.next()?;
-            Some(it.fold(first, |acc, r| make_syscall("$__wres", vec![acc, r], span)))
+            out
         };
         let own_a = take_drivers(&na);
         let own_b = take_drivers(&nb);
-        // A terminal with no driver of its own contributes high impedance.
-        let z = || make_z_expr(span);
-        let own_a = own_a.unwrap_or_else(z);
-        let own_b = own_b.unwrap_or_else(z);
 
-        let ctl = sw.ctl.clone().unwrap_or_else(|| {
-            Expression::new(
-                ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('1')),
+        // The switch conducts while its control is 1 (`tran*if1`), 0
+        // (`tran*if0`) or always (`tran`); an x/z control conducts as a
+        // tristate does, `L`/`H` (§28.8).
+        let on = match sw.ctl.clone() {
+            None => None,
+            Some(c) if sw.active_high => Some(c),
+            Some(c) => Some(Expression::new(
+                ExprKind::Unary {
+                    op: crate::ast::expr::UnaryOp::BitNot,
+                    operand: Box::new(c),
+                },
                 span,
-            )
-        });
-        let active = Expression::new(
-            ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(
-                if sw.active_high { '1' } else { '0' },
             )),
-            span,
-        );
+        };
+        let width = |n: &str| elab.signals.get(n).map(|s| s.width).unwrap_or(1).max(1);
+        let (wa, wb) = (width(&na), width(&nb));
+        let resistive = sw.resistive;
+        // A terminal resolves, by strength, its own drivers together with
+        // the other terminal's drivers seen through the switch: gated by the
+        // switch control and, for an `rtran*`, one level weaker (§28.13).
+        let terminal = |w: u32, own: &[StrengthDriver], far: &[StrengthDriver]| {
+            let mut args = vec![
+                const_value_literal(&Value::from_u64(u64::from(w), 32), span)
+                    .expect("width literal"),
+            ];
+            // Also kept for `%v` (§21.2.1.5), which reports the strength.
+            let mut drivers: Vec<StrengthDriver> = Vec::new();
+            let mut push = |d: &StrengthDriver, ctl: Option<Expression>, s0: u8, s1: u8| {
+                args.push(strength_code_literal(s0 * 8 + s1, span));
+                args.push(ctl.clone().unwrap_or_else(|| make_fill_expr(true, span)));
+                args.push(d.value.clone());
+                drivers.push(StrengthDriver {
+                    value: d.value.clone(),
+                    ctl,
+                    s0,
+                    s1,
+                });
+            };
+            for d in own {
+                push(d, d.ctl.clone(), d.s0, d.s1);
+            }
+            for d in far {
+                let ctl = match (d.ctl.clone(), on.clone()) {
+                    (Some(c), Some(o)) => Some(Expression::new(
+                        ExprKind::Binary {
+                            op: crate::ast::expr::BinaryOp::BitAnd,
+                            left: Box::new(c),
+                            right: Box::new(o),
+                        },
+                        span,
+                    )),
+                    (c, o) => c.or(o),
+                };
+                let (s0, s1) = if resistive {
+                    (rtran_strength(d.s0), rtran_strength(d.s1))
+                } else {
+                    (d.s0, d.s1)
+                };
+                push(d, ctl, s0, s1);
+            }
+            (make_syscall("$__sres", args, span), drivers)
+        };
+        let (rhs_a, drv_a) = terminal(wa, &own_a, &own_b);
+        let (rhs_b, drv_b) = terminal(wb, &own_b, &own_a);
+        elab.strength_drivers.insert(na.clone(), drv_a);
+        elab.strength_drivers.insert(nb.clone(), drv_b);
 
-        elab.continuous_assigns.push(ContinuousAssignment {
-            origin: None,
-            lhs: term_a,
-            rhs: make_syscall(
-                "$__tranif",
-                vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
-                span,
-            ),
-            delay: 0,
-            rhs_parent_scoped: false,
-            delay_fall: None,
-            delay_off: None,
-        });
-        elab.continuous_assigns.push(ContinuousAssignment {
-            origin: None,
-            lhs: term_b,
-            rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
-            delay: 0,
-            rhs_parent_scoped: false,
-            delay_fall: None,
-            delay_off: None,
-        });
+        for (lhs, rhs) in [(term_a, rhs_a), (term_b, rhs_b)] {
+            elab.continuous_assigns.push(ContinuousAssignment {
+                origin: None,
+                lhs,
+                rhs,
+                delay: 0,
+                rhs_parent_scoped: false,
+                delay_fall: None,
+                delay_off: None,
+            });
+        }
+    }
+}
+
+/// One driver of a bidirectional switch terminal, with its §28.12 strength
+/// pair: a strength marker's pair, a tristate primitive's control, or strong.
+fn switch_terminal_driver(ca: &ContinuousAssignment) -> StrengthDriver {
+    if let Some((ctl, data)) = gate_tristate_parts(ca) {
+        return StrengthDriver {
+            value: data.clone(),
+            ctl: Some(ctl.clone()),
+            s0: 6,
+            s1: 6,
+        };
+    }
+    if let ExprKind::SystemCall { name, args } = &ca.rhs.kind
+        && matches!(
+            name.as_str(),
+            "$__supply" | "$__drive" | "$__pull" | "$__weak"
+        )
+        && let (Some(v), Some(code)) = (
+            args.first(),
+            args.get(1)
+                .and_then(|c| const_eval_i64_with_params(c, None)),
+        )
+    {
+        let code = code as u8;
+        return StrengthDriver {
+            value: v.clone(),
+            ctl: None,
+            s0: code / 8,
+            s1: code % 8,
+        };
+    }
+    StrengthDriver {
+        value: ca.rhs.clone(),
+        ctl: None,
+        s0: 6,
+        s1: 6,
+    }
+}
+
+/// IEEE 1800-2017 §28.13 Table 28-8: the strength a resistive switch
+/// (`rtran`, `rtranif0`, `rtranif1`) passes for each strength level it
+/// receives (7 supply ... 0 highz, see `strength_level`).
+fn rtran_strength(s: u8) -> u8 {
+    match s {
+        7 | 6 => 5, // supply, strong -> pull
+        5 => 3,     // pull -> weak
+        4 | 3 => 2, // large, weak -> medium
+        2 | 1 => 1, // medium, small -> small
+        _ => 0,     // highz
     }
 }
 
@@ -40731,6 +40823,10 @@ where
     // left the switch permanently open.
     let active_high =
         !conditional || matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
+    let resistive = matches!(
+        gi.gate_type,
+        GateType::Rtran | GateType::Rtranif0 | GateType::Rtranif1
+    );
     for inst in &gi.instances {
         if inst.terminals.len() < 2 {
             continue;
@@ -40748,6 +40844,7 @@ where
             b: map(&inst.terminals[1]),
             ctl,
             active_high,
+            resistive,
         });
     }
     true
